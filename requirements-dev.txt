@@ -1,0 +1,4 @@
+# Dependências de Desenvolvimento e Testes
+-r requirements.txt
+pytest>=8.0.0
+flake8>=7.0.0

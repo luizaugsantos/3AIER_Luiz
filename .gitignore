@@ -1,0 +1,21 @@
+# Python & Ambiente
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Pytest & Cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Variáveis de ambiente e segredos
+.env
+.env.local
+
+# Streamlit
+.streamlit/
