@@ -1,0 +1,202 @@
+# Esteira de CI/CD: testa, publica na AWS (EC2 via S3 + SSM) e valida em produção.
+#
+# Dispara a cada push na main e manualmente (workflow_dispatch).
+# Sem chaves de acesso: autentica na AWS por OIDC (role criada pelo CloudFormation).
+#
+# Variables necessárias (Settings > Secrets and variables > Actions > Variables):
+#   AWS_ROLE_ARN     output GitHubRoleArn da stack
+#   AWS_REGION       output Region da stack
+#   AWS_STACK_NAME   output StackName da stack (padrão: agente-streamlit)
+#
+# A chave do modelo NÃO fica no GitHub: está no AWS Secrets Manager.
+# Os testes da esteira usam mocks e não gastam tokens.
+
+name: Deploy AWS
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  test:
+    name: Lint e testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (erros de sintaxe e nomes indefinidos quebram o build)
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Testes (unitários, contrato, integração, evals, segurança, memória, interface)
+        run: python -m pytest -m "not live_api" -v --junitxml=pytest-report.xml
+
+      - name: Publicar relatório dos testes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-aws
+          path: pytest-report.xml
+          if-no-files-found: ignore
+
+  deploy:
+    name: Deploy na AWS
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      pronto: ${{ steps.config.outputs.pronto }}
+      url: ${{ steps.stack.outputs.url }}
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: ${{ vars.AWS_STACK_NAME || 'agente-streamlit' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checar configuração
+        id: config
+        run: |
+          ausentes=()
+          [ -n "$AWS_ROLE_ARN" ] || ausentes+=("AWS_ROLE_ARN")
+          [ -n "$AWS_REGION" ] || ausentes+=("AWS_REGION")
+          if [ "${#ausentes[@]}" -gt 0 ]; then
+            echo "pronto=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Deploy pulado::Variables ausentes: ${ausentes[*]}"
+            {
+              echo "### Deploy pulado"
+              echo "Faltam as variables: \`${ausentes[*]}\`."
+              echo "Cadastre em Settings > Secrets and variables > Actions > Variables."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "pronto=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Autenticar na AWS (OIDC)
+        if: steps.config.outputs.pronto == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ler saídas da stack
+        id: stack
+        if: steps.config.outputs.pronto == 'true'
+        run: |
+          saida() {
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          {
+            echo "url=$(saida AppUrl)"
+            echo "instance=$(saida InstanceId)"
+            echo "bucket=$(saida BucketName)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Empacotar aplicação
+        if: steps.config.outputs.pronto == 'true'
+        run: |
+          zip -qr release.zip . \
+            -x ".git/*" ".github/*" "tests/*" "infra/*" ".pytest_cache/*" "*/__pycache__/*" \
+               "__pycache__/*" ".venv/*" "pytest-report.xml" "release.zip"
+          unzip -l release.zip | tail -n +4 | head -n -2
+
+      - name: Enviar pacote para o S3
+        if: steps.config.outputs.pronto == 'true'
+        env:
+          BUCKET: ${{ steps.stack.outputs.bucket }}
+        run: aws s3 cp release.zip "s3://$BUCKET/releases/$GITHUB_SHA.zip" --only-show-errors
+
+      - name: Aplicar na instância (SSM)
+        if: steps.config.outputs.pronto == 'true'
+        env:
+          INSTANCE: ${{ steps.stack.outputs.instance }}
+        run: |
+          # A instância pode demorar a registrar no SSM e a criar o deploy.sh (primeira vez).
+          cmd_id=""
+          for i in $(seq 1 30); do
+            cmd_id=$(aws ssm send-command \
+              --instance-ids "$INSTANCE" \
+              --document-name AWS-RunShellScript \
+              --parameters "commands=[\"test -x /opt/agent/deploy.sh && /opt/agent/deploy.sh releases/$GITHUB_SHA.zip\"]" \
+              --timeout-seconds 900 \
+              --query Command.CommandId --output text 2>/dev/null) && break
+            echo "[$i/30] instância ainda não aceita comandos; nova tentativa em 20s"
+            cmd_id=""
+            sleep 20
+          done
+          [ -n "$cmd_id" ] || { echo "::error::Não foi possível enviar o comando via SSM."; exit 1; }
+
+          for i in $(seq 1 90); do
+            sleep 10
+            status=$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            echo "[$i/90] SSM: $status"
+            case "$status" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE" \
+                  --query '[StandardOutputContent,StandardErrorContent]' --output text | tail -n 60
+                echo "::error::Deploy na instância terminou com status $status."
+                exit 1 ;;
+            esac
+            [ "$i" = 90 ] && { echo "::error::Tempo esgotado esperando o deploy."; exit 1; }
+          done
+          aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE" \
+            --query StandardOutputContent --output text | tail -n 15
+
+  smoke-test:
+    name: Smoke test em produção
+    needs: deploy
+    if: needs.deploy.outputs.pronto == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APP_URL: ${{ needs.deploy.outputs.url }}
+    steps:
+      - name: Verificar saúde e página inicial do Streamlit
+        run: |
+          base="${APP_URL%/}"
+          echo "Smoke test em: $base"
+          for i in $(seq 1 20); do
+            saude=$(curl -s -o /tmp/saude -w '%{http_code}' --max-time 15 "$base/_stcore/health" || true)
+            if [ "$saude" = "200" ] && [ "$(cat /tmp/saude)" = "ok" ]; then
+              home=$(curl -s -o /tmp/home -w '%{http_code}' --max-time 15 "$base/" || true)
+              if [ "$home" = "200" ] && grep -qi "streamlit" /tmp/home; then
+                echo "OK: /_stcore/health = ok e a página inicial respondeu 200."
+                exit 0
+              fi
+              echo "[$i/20] saúde ok, mas a página inicial devolveu $home"
+            else
+              echo "[$i/20] /_stcore/health devolveu '${saude:-sem resposta}'"
+            fi
+            sleep 10
+          done
+          echo "::error title=Smoke test falhou::$base não ficou saudável a tempo."
+          exit 1

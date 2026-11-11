@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Agente de IA com interface Streamlit em uma EC2 (Amazon Linux 2023, porta 80).
+  Deploy feito pelo GitHub Actions: o workflow envia o pacote para o S3 e manda
+  a EC2 aplicá-lo via SSM Run Command. Sem chaves de acesso no GitHub: o
+  workflow assume uma role por OIDC.
+
+# Para apagar tudo no fim do trabalho: esvazie o bucket de artefatos e apague a
+# stack (o CloudFormation não remove bucket com objetos).
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: Seu fork no formato dono/repositorio (ex. felipe/3AIER_Luiz)
+    AllowedPattern: "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    ConstraintDescription: Use o formato dono/repositorio
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch autorizada a fazer deploy
+  LlmApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 10
+    Description: Chave da API do modelo (Gemini ou OpenAI). Fica no Secrets Manager.
+  LlmBaseUrl:
+    Type: String
+    Default: https://generativelanguage.googleapis.com/v1beta/openai/
+    Description: Gemini = valor padrão. Para a OpenAI oficial, deixe em branco.
+  LlmModel:
+    Type: String
+    Default: gemini-2.5-flash
+    Description: Gemini = gemini-2.5-flash. OpenAI oficial = gpt-4o-mini.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Use "false" se a sua conta já tiver o provedor OIDC
+      token.actions.githubusercontent.com (IAM > Provedores de identidade).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  CreateOidc: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-releases-antigas
+            Status: Enabled
+            Prefix: releases/
+            ExpirationInDays: 30
+
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Configuração do modelo usada pelo agente (lida pela EC2 a cada deploy)
+      SecretString: !Sub '{"OPENAI_API_KEY":"${LlmApiKey}","OPENAI_BASE_URL":"${LlmBaseUrl}","OPENAI_MODEL":"${LlmModel}"}'
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ler-pacote-e-segredo
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${ArtifactsBucket.Arn}/releases/*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP publico para o agente Streamlit
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt AppSecurityGroup.GroupId
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-agente
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AppInstance --region ${AWS::Region}' EXIT
+
+          dnf install -y python3.11 python3.11-pip unzip aws-cfn-bootstrap
+
+          # 1 GB de swap: a instalação das dependências em 1 GB de RAM fica mais segura.
+          if [ ! -f /swapfile ]; then
+            dd if=/dev/zero of=/swapfile bs=1M count=1024
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          fi
+
+          useradd --system --create-home --home-dir /opt/agent/home --shell /sbin/nologin agent || true
+          mkdir -p /opt/agent/releases /etc/agent
+
+          cat > /etc/agent/config <<EOF_CONFIG
+          BUCKET=${ArtifactsBucket}
+          SECRET_ID=${AppSecret}
+          REGION=${AWS::Region}
+          EOF_CONFIG
+
+          cat > /opt/agent/deploy.sh <<'EOF_DEPLOY'
+          #!/bin/bash
+          # Uso: deploy.sh releases/<sha>.zip   (chamado pelo GitHub Actions via SSM)
+          set -euo pipefail
+          . /etc/agent/config
+          KEY="$1"
+          NOME="$(basename "$KEY" .zip)"
+          REL="/opt/agent/releases/$NOME"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+
+          aws s3 cp "s3://$BUCKET/$KEY" "$TMP/release.zip" --region "$REGION" --only-show-errors
+          rm -rf "$REL"
+          mkdir -p "$REL"
+          unzip -q "$TMP/release.zip" -d "$REL"
+          python3.11 -m venv "$REL/.venv"
+          "$REL/.venv/bin/python" -m pip install --quiet --no-cache-dir -r "$REL/requirements.txt"
+
+          # Variaveis do modelo -> arquivo lido pelo systemd (nunca vai para o log).
+          aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
+            --query SecretString --output text \
+            | python3.11 -c 'import json, sys
+          for chave, valor in json.load(sys.stdin).items():
+              if valor:
+                  print(chave + "=" + valor)' > "$TMP/env"
+          install -m 600 -o root -g root "$TMP/env" /etc/agent/env
+
+          chown -R agent:agent "$REL"
+          ln -sfn "$REL" /opt/agent/current
+          systemctl restart agent
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1/_stcore/health 2>/dev/null | grep -q ok; then
+              echo "Agente saudavel."
+              break
+            fi
+            if [ "$i" = 30 ]; then
+              journalctl -u agent -n 40 --no-pager
+              echo "O agente NAO ficou saudavel."
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # Mantem so as 3 releases mais recentes.
+          ls -1dt /opt/agent/releases/* | tail -n +4 | xargs -r rm -rf
+          echo "Deploy concluido: $NOME"
+          EOF_DEPLOY
+          chmod 755 /opt/agent/deploy.sh
+
+          cat > /etc/systemd/system/agent.service <<'EOF_UNIT'
+          [Unit]
+          Description=Agente Streamlit
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=agent
+          Group=agent
+          WorkingDirectory=/opt/agent/current
+          EnvironmentFile=/etc/agent/env
+          Environment=HOME=/opt/agent/home
+          ExecStart=/opt/agent/current/.venv/bin/python -m streamlit run app.py --server.port 80 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF_UNIT
+          systemctl daemon-reload
+          systemctl enable agent
+
+  AppIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref AppInstance
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Assumida pelo GitHub Actions (OIDC) para publicar o agente
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/${GitHubBranch}
+      Policies:
+        - PolicyName: publicar-agente
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EnviarPacote
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${ArtifactsBucket.Arn}/releases/*
+              - Sid: MandarComandoSomenteParaEstaInstancia
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${AppInstance}
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Sid: AcompanharComando
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: "*"
+              - Sid: LerSaidasDaStack
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
+
+Outputs:
+  AppUrl:
+    Description: Endereço do agente (front Streamlit)
+    Value: !Sub http://${AppIp}
+  InstanceId:
+    Description: ID da instância EC2
+    Value: !Ref AppInstance
+  BucketName:
+    Description: Bucket com os pacotes de deploy
+    Value: !Ref ArtifactsBucket
+  GitHubRoleArn:
+    Description: Valor da variável AWS_ROLE_ARN no GitHub
+    Value: !GetAtt GitHubDeployRole.Arn
+  Region:
+    Description: Valor da variável AWS_REGION no GitHub
+    Value: !Ref AWS::Region
+  StackName:
+    Description: Valor da variável AWS_STACK_NAME no GitHub
+    Value: !Ref AWS::StackName
