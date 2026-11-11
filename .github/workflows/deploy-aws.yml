@@ -3,7 +3,7 @@
 # Dispara a cada push na main e manualmente (workflow_dispatch).
 # Sem chaves de acesso: autentica na AWS por OIDC (role criada pelo CloudFormation).
 #
-# Variables necessárias (Settings > Secrets and variables > Actions > Variables):
+# Secrets OU Variables (Settings > Secrets and variables > Actions); Secret tem prioridade:
 #   AWS_ROLE_ARN     output GitHubRoleArn da stack
 #   AWS_REGION       output Region da stack
 #   AWS_STACK_NAME   output StackName da stack (padrão: agente-streamlit)
@@ -74,9 +74,9 @@ jobs:
       pronto: ${{ steps.config.outputs.pronto }}
       url: ${{ steps.stack.outputs.url }}
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      STACK_NAME: ${{ vars.AWS_STACK_NAME || 'agente-streamlit' }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION }}
+      STACK_NAME: ${{ secrets.AWS_STACK_NAME || vars.AWS_STACK_NAME || 'agente-streamlit' }}
     steps:
       - uses: actions/checkout@v4
 
