@@ -264,7 +264,17 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/${GitHubBranch}
+                # Aceita o formato classico e o formato com IDs (dono@id/repo@id) que o GitHub passou a emitir.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubRepo}:ref:refs/heads/${GitHubBranch}
+                  - !Join
+                    - ""
+                    - - "repo:"
+                      - !Select [0, !Split ["/", !Ref GitHubRepo]]
+                      - "@*/"
+                      - !Select [1, !Split ["/", !Ref GitHubRepo]]
+                      - "@*:ref:refs/heads/"
+                      - !Ref GitHubBranch
       Policies:
         - PolicyName: publicar-agente
           PolicyDocument:
